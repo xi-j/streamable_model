@@ -11,7 +11,6 @@ streamable convolutional network
 NOTE: 
 1. support centered convolution, centered transpose convolution and constant interpolation 
    centered mains odd kernel_size, padding = kernel_size // 2 and output_padding = stride - 1 for transpose convolution 
-   support stride, groups; not support dilation
 2. forward function accepts a fixed-length buffer of samples and returns a buffer of samples and an integer bad_output_length.
    bad samples are samples dependent on padding, not yet fully computed or dependent on other bad samples
    fully-computed, never-changed samples are good samples; corrected samples are good samples used to replace bad samples.
@@ -48,13 +47,9 @@ class StreamableModel(nn.Module):
             self.kernel_size = layer.kernel_size[0]
             self.stride = layer.stride[0]
             self.padding = self.kernel_size // 2
-            self.groups = layer.groups
 
-
-            # number of bad input samples from the previous layer in the last forward call
+            # number of input samples in self.buffer not fully computed from the previous layer, need to replace
             self.bad_input_length = 0
-            # number of bad output samples produced in the last forward call
-            self.bad_output_length = 0
 
             # store previous samples and new samples
             self.buffer_full_length = self.input_length + self.kernel_size - 1 + self.padding
@@ -132,7 +127,6 @@ class StreamableModel(nn.Module):
                 self.output_counter += (output_length - bad_output_length)
                 self.bad_input_length = bad_input_length
 
-                self.bad_output_length = bad_output_length
                 return output_buffer, bad_output_length
 
     '''
@@ -152,7 +146,7 @@ class StreamableModel(nn.Module):
             self.input_length = input_length
             self.layer_id = layer_id
 
-            self.interp = deepcopy(layer)
+            self.interp = layer
             self.scale_factor = (int) (layer.scale_factor)
             self.mode = layer.mode
             self.output_length = input_length * self.scale_factor
@@ -166,29 +160,6 @@ class StreamableModel(nn.Module):
         def forward(self, input_buffer, bad_input_length = 0):
             output_buffer = self.interp(input_buffer)
             bad_output_length = bad_input_length * self.scale_factor
-
-            return output_buffer, bad_output_length
-
-    '''
-    streamable activation e.g. ReLU, PReLU
-    '''
-    class StreamableActivation(nn.Module):
-        def __init__(self, layer:nn.ReLU, input_length:int, layer_id:int):
-            super().__init__()
-            self.input_length = input_length
-            self.layer_id = layer_id
-
-            self.activation = deepcopy(layer)
-
-        '''
-        @params:
-        input_buffer: input buffer with self.input_length samples
-        bad_input_length: number of samples not fully computed at the end of input buffer
-        @return: output buffer and number of samples not fully computed at the end of the output buffer
-        ''' 
-        def forward(self, input_buffer, bad_input_length = 0):
-            output_buffer = self.activation(input_buffer)
-            bad_output_length = bad_input_length
 
             return output_buffer, bad_output_length
 
@@ -281,7 +252,7 @@ class StreamableModel(nn.Module):
         '''
         @params:
         input_buffer: input buffer with self.input_length samples
-        bad_input_length: number of bad input samples at the end of input_buffer
+        bad_input_length: number of samples not fully computed at the end of input buffer
         @return: output buffer and number of samples not fully computed at the end of the output buffer
         ''' 
         def forward(self, input_buffer, bad_input_length = 0):
@@ -432,129 +403,50 @@ class StreamableModel(nn.Module):
                 self.good_output_counter += self.bad_output_start
 
                 return output_buffer, self.bad_output_length
-
-
-
+                
 
     '''
     @params:
-    input_length: number of samples per forward call to the first layer
+    buffer_length: number of samples per forward call to the first layer
     layers: a sequence of nn.Conv1d or nn.Upsample layers
     '''
-    def __init__(self, input_length:int, layers:nn.Sequential, shortcutDict = None, buffer_length_ratio = 2):  
+    def __init__(self, buffer_length:int, layers:torch.nn.Sequential):  
         super().__init__()
 
         # a container of streamable layer
         self.streamable_layers = []
         self.num_layers = len(layers)
 
+
+        input_length = buffer_length
         self.input_length = input_length
-        self.buffer_length_ratio = buffer_length_ratio
 
-        # compute the maximum number of bad input/output samples received/produced by each layer in stable condition
-        # compute the number of new input samples received/produced by each layer in stable condition
         # streamalize all layers
-        self.bad_samples_num = {}
-        self.bad_samples_num[0] = 0
-        self.new_samples_num = {}
-        self.new_samples_num[0] = self.input_length
-        self.total_samples_num = {}
-        self.total_samples_num[0] = self.input_length
-
-        new_input_length = self.input_length
-        for i in range(0, self.num_layers):
-            bad_input_length = self.bad_samples_num[i]
-            new_input_length = self.new_samples_num[i]
+        for i in range(self.num_layers):
 
             # streamalize nn.Conv1d
             if isinstance(layers[i], nn.Conv1d):
                 kernel_size = layers[i].kernel_size[0]
                 stride = layers[i].stride[0]
                 padding = kernel_size // 2
+                self.streamable_layers.append(self.StreamableConv1D(layers[i], input_length, i))
+                output_length = ceil((input_length + kernel_size - 1  - 1)/stride + 1)
+                input_length = output_length
 
-                full_input_length = new_input_length  + padding
-                good_input_length = new_input_length  - bad_input_length
-
-                full_output_length = (int)((full_input_length - padding - 1)/stride + 1)
-                good_output_length = (int)((good_input_length - padding - 1)/stride + 1)
-                bad_output_length = full_output_length - good_output_length
-                new_output_length  = ceil(new_input_length / stride)
-                total_output_length = bad_output_length + new_output_length
-
-                self.bad_samples_num[i + 1] = bad_output_length
-                self.new_samples_num[i + 1] = new_output_length
-                self.total_samples_num[i + 1] = total_output_length
-
-                self.streamable_layers.append(self.StreamableConv1D(layers[i], (bad_input_length + new_input_length)*buffer_length_ratio, i))
-
-            # streamalize nn.ConvTranspose1d
-            elif isinstance(layers[i], nn.ConvTranspose1d):
-                kernel_size = layers[i].kernel_size[0]
-                stride = layers[i].stride[0]
-                padding = kernel_size // 2
-
-                bad_output_length = bad_input_length * stride + padding
-                new_output_length = new_input_length * stride
-                total_output_length = bad_output_length + new_output_length
-
-                self.bad_samples_num[i + 1] = bad_output_length
-                self.new_samples_num[i + 1] = new_output_length
-                self.total_samples_num[i + 1] = total_output_length
-
-                self.streamable_layers.append(self.StreamableConvT1D(layers[i], (bad_input_length + new_input_length)*buffer_length_ratio, i))
-                
             # streamalize nn.Upsample with mode = 'nearest'
             elif isinstance(layers[i], nn.Upsample) and layers[i].mode == 'nearest':
                 scale_factor = (int) (layers[i].scale_factor)
+                self.streamable_layers.append(self.StreambleConstInterpolation(layers[i], input_length, i))
+                output_length = input_length * scale_factor
+                input_length = output_length
 
-                bad_output_length = bad_input_length * scale_factor
-                new_output_length = new_input_length * scale_factor
-                total_output_length = bad_output_length + new_output_length
-                
-                self.bad_samples_num[i + 1] = bad_output_length
-                self.new_samples_num[i + 1] = new_output_length
-                self.total_samples_num[i + 1] = total_output_length
-
-                self.streamable_layers.append(self.StreambleConstInterpolation(layers[i], bad_input_length + new_input_length, i))
-
-            # streamalize activations 
-            elif isinstance(layers[i], nn.ReLU) or isinstance(layers[i], nn.PReLU):
-
-                bad_output_length = bad_input_length
-                new_output_length = new_input_length
-                total_output_length = bad_output_length + new_output_length
-
-                self.bad_samples_num[i + 1] = bad_output_length
-                self.new_samples_num[i + 1] = new_output_length
-                self.total_samples_num[i + 1] = total_output_length
-
-                self.streamable_layers.append(self.StreamableActivation(layers[i], bad_input_length + new_input_length, i))
-
-
-        # allocate space for residual connections
-        self.residual_flag = bool(shortcutDict)
-        if self.residual_flag:
-            # self.shortcutDict[i] = j means ith layer's input is connected by jth layer's output, i - j > 1
-            self.shortcutDict = shortcutDict.copy()
-
-            # save output buffer of residual layer
-            self.buffer_img = {}
-            self.residual_bad_samples_num = {}
-            for i in self.shortcutDict.keys():
-                j = self.shortcutDict[i]
-                length = self.total_samples_num[i]
-
-                if isinstance(self.streamable_layers[i], StreamableModel.StreamableConv1D) or isinstance(self.streamable_layers[i], StreamableModel.StreamableConvT1D):
-                    in_channels = self.streamable_layers[i].in_channels
-                elif isinstance(self.streamable_layers[j], StreamableModel.StreamableConv1D) or isinstance(self.streamable_layers[j], StreamableModel.StreamableConvT1D):
-                    in_channels = self.streamable_layers[j].out_channels
-                elif i - 1 > 0 and (isinstance(self.streamable_layers[i-1], StreamableModel.StreamableConv1D) or isinstance(self.streamable_layers[i-1], StreamableModel.StreamableConvT1D)):
-                    in_channels = self.streamable_layers[i - 1].in_channels
-                elif j - 1 > 0 and (isinstance(self.streamable_layers[j-1], StreamableModel.StreamableConv1D) or isinstance(self.streamable_layers[j-1], StreamableModel.StreamableConvT1D)):
-                    in_channels = self.streamable_layers[j - 1].out_channels
-
-                self.buffer_img[j] = torch.zeros(1, in_channels, length*buffer_length_ratio)
-                self.residual_bad_samples_num[j] = 0
+            # streamalize nn.ConvTranspose1d
+            elif isinstance(layers[i], nn.ConvTranspose1d):
+                scale_factor = (int) (layers[i].stride[0])
+                self.streamable_layers.append(self.StreamableConvT1D(layers[i], input_length, i))
+                output_length = input_length * scale_factor
+                input_length = output_length
+            
 
     def __len__(self):
         return self.num_layers
@@ -563,6 +455,9 @@ class StreamableModel(nn.Module):
         return self.streamable_layers[i]
 
 
+    #
+    # 1 ... 18' 19' 20'
+    #
 
     '''
     @params:
@@ -570,157 +465,70 @@ class StreamableModel(nn.Module):
     @return: output buffer and number of samples not fully computed at the end of the output buffer
     ''' 
     def forward(self, buffer):
-        if self.residual_flag:
-            return self.residual_forward(buffer)
-
         bad_input_length = 0
         for i in range(self.num_layers):
             buffer, bad_output_length = self.streamable_layers[i](buffer, bad_input_length)
             bad_input_length = bad_output_length
 
-
         return buffer, bad_output_length
 
+'''
+(relu prelu w/ alpha = 0) prelu;
 
-    '''
-    @params:
-    buffer: input buffer with self.input_length samples
-    @return: output buffer and number of samples not fully computed at the end of the output buffer
-    ''' 
-    def residual_forward(self, buffer):
-        bad_input_length = 0
-        for i in range(self.num_layers):
+conv1d : group: 1 or in_channels
+residual: list/dict store output samples
+bad_input_length in construction
 
-            # skip connections: output of layer j connects to input of layer i 
-            if i in self.shortcutDict:
-
-                j = self.shortcutDict[i]
-
-                latest_length = buffer.shape[2]
-                residual = self.buffer_img[j][:, :, -latest_length:]
-
-                residual_bad_input_length = self.residual_bad_samples_num[j]
-
-                buffer, bad_output_length = self.streamable_layers[i](buffer + residual, max(residual_bad_input_length, bad_input_length))
-                bad_input_length = bad_output_length
-
-            else:
-                buffer, bad_output_length = self.streamable_layers[i](buffer, bad_input_length)
-                bad_input_length = bad_output_length
-
-            # copy residuals 
-            if i in self.buffer_img:
-
-                residual_length = buffer.shape[2]
-                bad_residual_length =  self.residual_bad_samples_num[i]
-                good_residual_length = residual_length - bad_residual_length
-
-                self.buffer_img[i] = torch.roll(self.buffer_img[i], -good_residual_length, dims = 2)
-                self.buffer_img[i][:, :, -residual_length:] = buffer.clone()
-                self.residual_bad_samples_num[i] = bad_input_length
-
-
-        return buffer, bad_output_length
-
-
-
-
-# not part of streamable model, used for testing
-def residual_forward(layers: nn.Sequential, shortcutDict: dict, x):
-    if shortcutDict == None:
-        return layers(x)
-
-    buffer_img = dict.fromkeys(shortcutDict.values(), 0)
-    num_layers = len(layers)
-
-    for i in range(num_layers):
-        if i in shortcutDict:
-            j = shortcutDict[i]
-            residual = buffer_img[j]
-            x = layers[i](x + residual)
-
-        else:
-            x = layers[i](x)
-
-        if i in buffer_img:
-            buffer_img[i] = x.clone()
-
-    return x
-
-
+'''
 ###########################################################################################################################################################################################################################
 ###########################################################################################################################################################################################################################
 # testing
 if __name__ == '__main__':
 
-    buffer_length = 24 * 4
-    buffer_num = 100
+    buffer_length = 20 
+    buffer_num = 200
     sample_num  = buffer_length * buffer_num
 
     '''
     my_model = nn.Sequential(nn.ConvTranspose1d(3, 1, kernel_size = 5, stride = 2, padding = 5//2, output_padding = 2 - 1))
+    my_model = nn.Sequential(nn.Conv1d(3, 3, kernel_size = 7, stride = 2, padding = 7//2), nn.Conv1d(3, 3, kernel_size = 5, stride = 2, padding = 5//2),\
+                            nn.ConvTranspose1d(3, 3, kernel_size = 7, stride = 4, padding = 7//2, output_padding = 4 - 1), nn.ConvTranspose1d(3, 3, kernel_size = 11, stride = 5, padding = 11//2, output_padding = 5 - 1))
+    
 
-    my_model = nn.Sequential(nn.Conv1d(1, 4, kernel_size = 7, stride = 3, padding = 7//2), nn.Conv1d(4, 4, kernel_size = 5, stride = 2, padding = 5//2), \
-                             nn.Conv1d(4, 4, kernel_size = 3, stride = 2, padding = 3//2), nn.Conv1d(4, 4, kernel_size = 3, stride = 1, padding = 3//2), \
-                             nn.Conv1d(4, 4, kernel_size = 3, stride = 1, padding = 3//2), nn.Conv1d(4, 1, kernel_size = 3, stride = 1, padding = 3//2))
+    my_model = []
+    my_model.append(nn.Conv1d(3, 256, kernel_size = 21, stride = 10, padding = 21//2))
+    for i in range(32):
+        my_model.append(nn.Conv1d(256, 256, kernel_size = 3, stride = 1, padding = 3//2))
+    my_model.append(nn.ConvTranspose1d(256, 256, kernel_size = 21, stride = 10, padding = 21//2, output_padding = 10 - 1))
+    my_model= nn.Sequential(*my_model)
 
+
+    my_model = nn.Sequential(nn.Conv1d(3, 3, kernel_size = 7, stride = 2, padding = 7//2), nn.Conv1d(3, 3, kernel_size = 3, stride = 1, padding = 3//2),\
+                            nn.Conv1d(3, 3, kernel_size = 3, stride = 1, padding = 3//2),  nn.Conv1d(3, 3, kernel_size = 3, stride = 1, padding = 3//2),\
+                            nn.Conv1d(3, 3, kernel_size = 3, stride = 1, padding = 3//2),  nn.Conv1d(3, 3, kernel_size = 3, stride = 1, padding = 3//2),\
+                            nn.ConvTranspose1d(3, 1, kernel_size = 7, stride = 2, padding = 7//2, output_padding = 2-1, bias = True))
+
+    '''
 
     my_model = []
     my_model.append(nn.Conv1d(1, 256, kernel_size = 21, stride = 10, padding = 21//2))
     for i in range(32):
-        my_model.append(nn.Conv1d(256, 256, kernel_size = 3, stride = 1, padding = 3//2, groups = 256))
-    my_model.append(nn.ConvTranspose1d(256, 256, kernel_size = 21, stride = 10, padding = 21//2, output_padding = 10 - 1))
-    my_model= nn.Sequential(*my_model)
-
-    my_model = nn.Sequential(nn.Conv1d(1, 4, kernel_size = 9, stride = 4, padding = 9//2), \
-                             nn.Conv1d(4, 4, kernel_size = 7, stride = 3, padding = 7//2), \
-                             nn.Conv1d(4, 4, kernel_size = 5, stride = 2, padding = 5//2), \
-                             nn.Conv1d(4, 4, kernel_size = 3, stride = 1, padding = 3//2), \
-                             nn.Conv1d(4, 4, kernel_size = 3, stride = 1, padding = 3//2), \
-                             nn.Conv1d(4, 4, kernel_size = 3, stride = 1, padding = 3//2), \
-                             nn.Conv1d(4, 4, kernel_size = 3, stride = 1, padding = 3//2), \
-                             nn.ConvTranspose1d(4, 4, kernel_size = 5, stride = 2, padding = 5//2, output_padding = 2-1), \
-                             nn.ConvTranspose1d(4, 4, kernel_size = 7, stride = 3, padding = 7//2, output_padding = 3-1), \
-                             nn.ConvTranspose1d(4, 1, kernel_size = 9, stride = 4, padding = 9//2, output_padding = 4-1))
-                            
-   
-    '''
-    my_model = []
-    my_model.append(nn.Conv1d(1, 256, kernel_size = 21, stride = 10, padding = 21//2))
-    my_model.append(nn.ReLU())
-    for i in range(10):
-        my_model.append(nn.Conv1d(256, 256, kernel_size = 3, stride = 1, padding = 3//2, groups = 256))
-        my_model.append(nn.ReLU())
+        my_model.append(nn.Conv1d(256, 256, kernel_size = 3, stride = 1, padding = 3//2))
     my_model.append(nn.ConvTranspose1d(256, 256, kernel_size = 21, stride = 10, padding = 21//2, output_padding = 10 - 1))
     my_model= nn.Sequential(*my_model)
 
 
-  
-    my_model = nn.Sequential(nn.Conv1d(1, 4, kernel_size = 9, stride = 4, padding = 9//2), \
-                             nn.Conv1d(4, 4, kernel_size = 7, stride = 3, padding = 7//2), \
-                             nn.Conv1d(4, 4, kernel_size = 5, stride = 2, padding = 5//2), \
-                             nn.Conv1d(4, 4, kernel_size = 3, stride = 1, padding = 3//2), \
-                             nn.Conv1d(4, 4, kernel_size = 3, stride = 1, padding = 3//2), \
-                             nn.Conv1d(4, 4, kernel_size = 3, stride = 1, padding = 3//2), \
-                             nn.Conv1d(4, 4, kernel_size = 3, stride = 1, padding = 3//2), \
-                             nn.Upsample(scale_factor = 2),\
-                             nn.Upsample(scale_factor = 3),\
-                             nn.Upsample(scale_factor = 4))
-                             #nn.ConvTranspose1d(4, 4, kernel_size = 5, stride = 2, padding = 5//2, output_padding = 2-1), \
-                             #nn.ConvTranspose1d(4, 4, kernel_size = 7, stride = 3, padding = 7//2, output_padding = 3-1), \
-                             #nn.ConvTranspose1d(4, 1, kernel_size = 9, stride = 4, padding = 9//2, output_padding = 4-1))
-                 
 
-    residual_connection = {9 : 0,  8 : 1, 7 : 2}
-
-    my_streamable_model = StreamableModel(buffer_length, my_model, residual_connection)
+    my_streamable_model = StreamableModel(buffer_length, my_model)
 
     test_signal = torch.rand(1, 1, sample_num) 
-
-    output_ref = residual_forward(my_model, residual_connection, test_signal)
-
+    output_ref = my_model(test_signal)
     output_full = torch.zeros(output_ref.shape)
     output_counter = 0
+
+
+    print("reference full output:")
+    print(output_ref)
 
     print("##############################################################")
     print("buffer_num:", buffer_num, "buffer_length:", buffer_length)
@@ -733,17 +541,15 @@ if __name__ == '__main__':
         output_length = output_buffer.shape[2] 
 
         # re-run static model up to buffer_length*(i+1) samples 
-        full_output = residual_forward(my_model, residual_connection, test_signal[:, :, :buffer_length*(i+1)])
-
+        full_output = my_model(test_signal[:, :, :buffer_length*(i+1)])
         output_buffer_ref = full_output[:, :, -output_length:]
 
         equal = (abs(output_buffer_ref - output_buffer) < 1e-5).all().item()
 
         print("No.{} buffer output:".format(i))
-        print(output_buffer[:, 0, :])
+        print(output_buffer)
         print("number of bad output samples: ", bad_output_length)
         print("total number of output samples including corrected samples and bad samples:" , output_length)
-
 
         if equal:
             print("No.{} buffer output passed".format(i))
@@ -751,20 +557,16 @@ if __name__ == '__main__':
             print("WRONG OUTPUT!!!")
             print("WRONG OUTPUT!!!")
             print("WRONG OUTPUT!!!")
-            print("correct output:\n" ,output_buffer_ref[:, 0, :])
+            print("correct output:\n" ,output_buffer_ref)
 
                  
         output_full[:, :, output_counter : output_counter + output_length] = output_buffer
 
-        output_counter += full_output_length 
+        output_counter += (output_length - bad_output_length)
         print("output_counter:", output_counter)
-        output_counter -= bad_output_length
         print("___________________________________________________________________")
 
 
-
-    print("reference full output:")
-    print(output_ref)
 
     equal = (abs(output_ref - output_full) < 1e-5).all().item()
     if equal:
